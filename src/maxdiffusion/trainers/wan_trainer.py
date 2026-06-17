@@ -34,12 +34,15 @@ class WanTrainer(BaseWanTrainer):
 
   def get_data_shardings(self, mesh):
     data_sharding = jax.sharding.NamedSharding(mesh, P(*self.config.data_sharding))
-    data_sharding = {"latents": data_sharding, "encoder_hidden_states": data_sharding}
+    data_sharding = {"latents": data_sharding, "proj_ids": data_sharding, "proj_depth": data_sharding}
     return data_sharding
 
   def get_eval_data_shardings(self, mesh):
     data_sharding = jax.sharding.NamedSharding(mesh, P(*self.config.data_sharding))
-    data_sharding = {"latents": data_sharding, "encoder_hidden_states": data_sharding, "timesteps": data_sharding}
+    data_sharding = {
+        "latents": data_sharding, "proj_ids": data_sharding, "proj_depth": data_sharding,
+        "timesteps": data_sharding,
+    }
     return data_sharding
 
   def load_dataset(self, mesh, pipeline=None, is_training=True):
@@ -84,22 +87,27 @@ class WanTrainer(BaseWanTrainer):
       )
     feature_description = {
         "latents": tf.io.FixedLenFeature([], tf.string),
-        "encoder_hidden_states": tf.io.FixedLenFeature([], tf.string),
+        "proj_ids": tf.io.FixedLenFeature([], tf.string),
+        "proj_depth": tf.io.FixedLenFeature([], tf.string),
     }
 
     if not is_training:
       feature_description["timesteps"] = tf.io.FixedLenFeature([], tf.int64)
 
+    def _parse_cond(features):
+      return {
+          "latents": tf.io.parse_tensor(features["latents"], out_type=tf.float32),
+          "proj_ids": tf.io.parse_tensor(features["proj_ids"], out_type=tf.int32),
+          "proj_depth": tf.io.parse_tensor(features["proj_depth"], out_type=tf.float16),
+      }
+
     def prepare_sample_train(features):
-      latents = tf.io.parse_tensor(features["latents"], out_type=tf.float32)
-      encoder_hidden_states = tf.io.parse_tensor(features["encoder_hidden_states"], out_type=tf.float32)
-      return {"latents": latents, "encoder_hidden_states": encoder_hidden_states}
+      return _parse_cond(features)
 
     def prepare_sample_eval(features):
-      latents = tf.io.parse_tensor(features["latents"], out_type=tf.float32)
-      encoder_hidden_states = tf.io.parse_tensor(features["encoder_hidden_states"], out_type=tf.float32)
-      timesteps = features["timesteps"]
-      return {"latents": latents, "encoder_hidden_states": encoder_hidden_states, "timesteps": timesteps}
+      sample = _parse_cond(features)
+      sample["timesteps"] = features["timesteps"]
+      return sample
 
     data_iterator = make_data_iterator(
         config,
@@ -142,9 +150,11 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
   def loss_fn(params):
     model = nnx.merge(state.graphdef, params, state.rest_of_state)
     latents = data["latents"].astype(config.weights_dtype)
-    encoder_hidden_states = data["encoder_hidden_states"].astype(config.weights_dtype)
 
     bsz = latents.shape[0]
+    # Text is dropped (Phase 1); feed a zero embedding to the (still-present) cross-attention.
+    # 4096 = Wan 2.1 UMT5 text dim; cross-attn + T5 are removed entirely in Phase 2.
+    encoder_hidden_states = jnp.zeros((bsz, 1, 4096), dtype=config.weights_dtype)
     timesteps = scheduler.sample_timesteps(timestep_rng, bsz)
     noise = jax.random.normal(key=new_rng, shape=latents.shape, dtype=latents.dtype)
     noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
@@ -153,6 +163,8 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
           hidden_states=noisy_latents,
           timestep=timesteps,
           encoder_hidden_states=encoder_hidden_states,
+          proj_ids=data["proj_ids"],
+          proj_depth=data["proj_depth"].astype(config.weights_dtype),
           deterministic=False,
           rngs=nnx.Rngs(dropout=dropout_rng),
       )
