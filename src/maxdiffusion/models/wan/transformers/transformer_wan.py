@@ -535,6 +535,79 @@ class WanTransformerBlock(nnx.Module):
     return self.attn2.compute_kv(encoder_hidden_states, encoder_attention_mask)
 
 
+class WanVoxelProjectionEmbedder(nnx.Module):
+  """Encodes a per-pixel depth-ordered voxel-id + depth stack into latent-grid conditioning channels.
+
+  Input per frame: `ids (B,T,H,W,L)` integer voxel classes (0 = empty) and `depth (B,T,H,W,L)` linear
+  camera-space depth. Each id is embedded (learned table), a sinusoidal depth positional encoding is
+  concatenated, then a 1D conv compresses the L depth layers (kernel `depth_patch_size`, stride
+  `depth_stride`, VALID) to `out_layers = (L - depth_patch_size)//depth_stride + 1`. Output is the
+  flattened `(B,T,H,W, out_layers * out_dim)` to channel-concat onto the noisy latent before patch
+  embedding. With defaults (L=192, feat=32, freqs=8, k6/s4, out=16): 40 -> 47x16 = 752 channels.
+  """
+
+  def __init__(
+      self,
+      rngs: nnx.Rngs,
+      vocab: int,
+      feat_dim: int = 32,
+      num_layers: int = 192,
+      depth_patch_size: int = 6,
+      depth_stride: int = 4,
+      out_dim: int = 16,
+      num_freqs: int = 8,
+      max_period: float = 10000.0,
+      depth_scale: float = 1.0,
+      use_depth_pos_enc: bool = True,
+      dtype: jnp.dtype = jnp.float32,
+      weights_dtype: jnp.dtype = jnp.float32,
+      precision: jax.lax.Precision = None,
+  ):
+    self.num_freqs = num_freqs
+    self.max_period = max_period
+    self.depth_scale = depth_scale
+    self.use_depth_pos_enc = use_depth_pos_enc
+    self.out_layers = (num_layers - depth_patch_size) // depth_stride + 1
+    self.out_dim = out_dim
+    self.dtype = dtype
+    self.voxel_embed = nnx.Embed(
+        num_embeddings=vocab,
+        features=feat_dim,
+        rngs=rngs,
+        dtype=dtype,
+        param_dtype=weights_dtype,
+    )
+    conv_in = feat_dim + (num_freqs if use_depth_pos_enc else 0)
+    self.proj = nnx.Conv(
+        conv_in,
+        out_dim,
+        rngs=rngs,
+        kernel_size=(depth_patch_size,),
+        strides=(depth_stride,),
+        padding="VALID",
+        dtype=dtype,
+        param_dtype=weights_dtype,
+        precision=precision,
+        kernel_init=nnx.with_partitioning(nnx.initializers.xavier_uniform(), (None, None, "conv_out")),
+    )
+
+  def _depth_pos_enc(self, depth: jax.Array) -> jax.Array:
+    """Sinusoidal encoding of depth -> (..., num_freqs)."""
+    half = self.num_freqs // 2
+    freqs = jnp.exp(-math.log(self.max_period) * jnp.arange(half, dtype=jnp.float32) / half)
+    args = (depth * self.depth_scale).astype(jnp.float32)[..., None] * freqs
+    return jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
+
+  def __call__(self, ids: jax.Array, depth: jax.Array) -> jax.Array:
+    b, t, h, w, ell = ids.shape
+    x = self.voxel_embed(ids)                                      # (B,T,H,W,L,feat)
+    if self.use_depth_pos_enc:
+      x = jnp.concatenate([x, self._depth_pos_enc(depth).astype(x.dtype)], axis=-1)
+    x = x.reshape(b * t * h * w, ell, x.shape[-1])                 # (N, L, conv_in)
+    x = self.proj(x)                                               # (N, out_layers, out_dim), VALID
+    return x.reshape(b, t, h, w, self.out_layers * self.out_dim)   # (B,T,H,W, out_layers*out_dim)
+
+
 class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
 
   @register_to_config
@@ -574,6 +647,15 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       scan_layers: bool = True,
       enable_jax_named_scopes: bool = False,
       attention_config: Optional[dict] = None,
+      enable_voxel_cond: bool = False,
+      cond_vocab: int = 1,
+      cond_feat_dim: int = 32,
+      cond_layers: int = 192,
+      cond_depth_patch: int = 6,
+      cond_depth_stride: int = 4,
+      cond_out_dim: int = 16,
+      cond_num_freqs: int = 8,
+      cond_depth_scale: float = 1.0,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
@@ -589,8 +671,30 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
 
     # 1. Patch & position embedding
     self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
+    # Voxel-projection conditioning is channel-concatenated onto the noisy latent before patch
+    # embedding, widening the patch-embed input channels (the new channels are zero-initialized at
+    # load time so the pretrained model is undisturbed at init).
+    self.enable_voxel_cond = enable_voxel_cond
+    self.voxel_cond = nnx.data(None)
+    patch_in_channels = in_channels
+    if enable_voxel_cond:
+      self.voxel_cond = WanVoxelProjectionEmbedder(
+          rngs=rngs,
+          vocab=cond_vocab,
+          feat_dim=cond_feat_dim,
+          num_layers=cond_layers,
+          depth_patch_size=cond_depth_patch,
+          depth_stride=cond_depth_stride,
+          out_dim=cond_out_dim,
+          num_freqs=cond_num_freqs,
+          depth_scale=cond_depth_scale,
+          dtype=dtype,
+          weights_dtype=weights_dtype,
+          precision=precision,
+      )
+      patch_in_channels = in_channels + self.voxel_cond.out_layers * cond_out_dim
     self.patch_embedding = nnx.Conv(
-        in_channels,
+        patch_in_channels,
         inner_dim,
         rngs=rngs,
         kernel_size=patch_size,
@@ -771,6 +875,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       kv_cache: Optional[Dict[str, Tuple[jax.Array, jax.Array]]] = None,
       rotary_emb: Optional[jax.Array] = None,
       encoder_attention_mask: Optional[jax.Array] = None,
+      proj_ids: Optional[jax.Array] = None,
+      proj_depth: Optional[jax.Array] = None,
   ) -> Union[jax.Array, Tuple[jax.Array, jax.Array], Dict[str, jax.Array]]:
     hidden_states = nn.with_logical_constraint(hidden_states, ("batch", None, None, None, None))
     batch_size, _, num_frames, height, width = hidden_states.shape
@@ -783,6 +889,10 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
     with self.conditional_named_scope("rotary_embedding"):
       if rotary_emb is None:
         rotary_emb = self.rope(hidden_states)
+    if self.enable_voxel_cond and proj_ids is not None:
+      with self.conditional_named_scope("voxel_conditioning"):
+        raster_cond = self.voxel_cond(proj_ids, proj_depth)
+        hidden_states = jnp.concatenate([hidden_states, raster_cond.astype(hidden_states.dtype)], axis=-1)
     with self.conditional_named_scope("patch_embedding"):
       hidden_states = self.patch_embedding(hidden_states)
       hidden_states = jax.lax.collapse(hidden_states, 1, -1)
