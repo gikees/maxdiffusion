@@ -126,7 +126,9 @@ def _make_tfrecord_iterator(
     return {"pixel_values": moments, "input_ids": clip_embeddings}
 
   filenames = tf.io.gfile.glob(os.path.join(dataset_path, "*"))
-  ds = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTOTUNE)
+  ds = tf.data.TFRecordDataset(
+      filenames, compression_type=(getattr(config, "tfrecord_compression", "") or None), num_parallel_reads=AUTOTUNE
+  )
 
   # --- PADDING LOGIC FOR EVALUATION ---
   if not is_training:

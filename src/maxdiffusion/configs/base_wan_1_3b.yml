@@ -283,6 +283,7 @@ disable_training_weights: False # if True, disables the use of mid-point loss we
 # For creating tfrecords from dataset
 tfrecords_dir: ''
 no_records_per_shard: 0
+tfrecord_compression: ''  # '' = uncompressed; 'GZIP' to read gzip-compressed tfrecords (voxel-conditioning data)
 enable_eval_timesteps: False
 timesteps_list: [125, 250, 375, 500, 625, 750, 875]
 num_eval_samples: 420

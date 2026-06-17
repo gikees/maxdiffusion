@@ -89,7 +89,8 @@ def main():
     t = min(len(rgb), len(ids_all))
     out = os.path.join(OUT_DIR, stem + ".tfrec")
     n = 0
-    with tf.io.TFRecordWriter(out) as writer:
+    # GZIP: the projection stacks are sparse (mostly-empty deeper layers); compresses ~10-20x.
+    with tf.io.TFRecordWriter(out, options=tf.io.TFRecordOptions(compression_type="GZIP")) as writer:
       for start in range(0, t - NUM_FRAMES + 1, NUM_FRAMES):
         clip = rgb[start:start + NUM_FRAMES].astype(np.float32) / 127.5 - 1.0   # (F, H, W, 3) in [-1,1]
         with vae_mesh, nn_partitioning.axis_rules(vae_rules):
@@ -103,7 +104,7 @@ def main():
     print(f"  {stem}: T={t} -> {n} clips", flush=True)
 
   # Read-back check on the last shard.
-  ds = tf.data.TFRecordDataset([out])
+  ds = tf.data.TFRecordDataset([out], compression_type="GZIP")
   for raw in ds.take(1):
     ex = tf.train.Example.FromString(raw.numpy())
     lat = tf.io.parse_tensor(ex.features.feature["latents"].bytes_list.value[0], tf.float32)
