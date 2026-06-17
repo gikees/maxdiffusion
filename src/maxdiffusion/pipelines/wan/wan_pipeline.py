@@ -131,6 +131,41 @@ def _select_restored_transformer_state(restored_checkpoint, subfolder: str):
   raise ValueError(f"Unsupported WAN checkpoint transformer subfolder `{subfolder}`.")
 
 
+def _inject_voxel_cond_params(params, wan_config, rngs):
+  """Adapt a base (non-conditioned) Wan checkpoint for voxel conditioning.
+
+  Widens the pretrained `patch_embedding` kernel to the conditioned model's input channels —
+  pretrained weights into the first `in_channels`, zeros for the new conditioning channels so the
+  pretrained model is undisturbed at init — and initializes the new `voxel_cond` params (absent from
+  the base checkpoint) from a freshly-constructed embedder.
+  """
+  import jax.numpy as jnp
+  from ...models.wan.transformers.transformer_wan import WanVoxelProjectionEmbedder
+
+  out_layers = (wan_config["cond_layers"] - wan_config["cond_depth_patch"]) // wan_config["cond_depth_stride"] + 1
+  raster_ch = out_layers * wan_config["cond_out_dim"]
+  pe = params["patch_embedding"]["kernel"]  # (*patch_size, in_channels, inner_dim)
+  pad = jnp.zeros(pe.shape[:-2] + (raster_ch, pe.shape[-1]), pe.dtype)
+  params["patch_embedding"]["kernel"] = jnp.concatenate([pe, pad], axis=-2)
+
+  enc = WanVoxelProjectionEmbedder(
+      rngs=rngs,
+      vocab=wan_config["cond_vocab"],
+      feat_dim=wan_config["cond_feat_dim"],
+      num_layers=wan_config["cond_layers"],
+      depth_patch_size=wan_config["cond_depth_patch"],
+      depth_stride=wan_config["cond_depth_stride"],
+      out_dim=wan_config["cond_out_dim"],
+      num_freqs=wan_config["cond_num_freqs"],
+      depth_scale=wan_config.get("cond_depth_scale", 1.0),
+      dtype=wan_config["dtype"],
+      weights_dtype=wan_config["weights_dtype"],
+      precision=wan_config["precision"],
+  )
+  params["voxel_cond"] = nnx.state(enc, nnx.Param).to_pure_dict()
+  return params
+
+
 # For some reason, jitting this function increases the memory significantly, so instead manually move weights to device.
 def create_sharded_logical_transformer(
     devices_array: np.array,
@@ -175,6 +210,18 @@ def create_sharded_logical_transformer(
       "use_experimental_scheduler": config.use_experimental_scheduler,
       "ulysses_shards": getattr(config, "ulysses_shards", -1),
   }
+  # Voxel-projection conditioning (depth-ordered voxel-id + depth stack channel-concatenated onto the
+  # noisy latent). Plumbed from the run config; off by default so base Wan is unaffected.
+  if getattr(config, "enable_voxel_cond", False):
+    wan_config["enable_voxel_cond"] = True
+    wan_config["cond_vocab"] = config.cond_voxel_vocab
+    wan_config["cond_feat_dim"] = config.cond_feat_dim
+    wan_config["cond_layers"] = config.cond_layers
+    wan_config["cond_depth_patch"] = config.cond_depth_patch
+    wan_config["cond_depth_stride"] = config.cond_depth_stride
+    wan_config["cond_out_dim"] = config.cond_out_dim
+    wan_config["cond_num_freqs"] = config.cond_num_freqs
+    wan_config["cond_depth_scale"] = config.cond_depth_scale
 
   # 2. eval_shape - will not use flops or create weights on device
   # thus not using HBM memory.
@@ -207,6 +254,11 @@ def create_sharded_logical_transformer(
         scan_layers=config.scan_layers,
         subfolder=subfolder,
     )
+
+  # When loading a base (non-conditioned) checkpoint into a voxel-conditioned model, pad the
+  # patch-embedding (zeros for the new channels) and initialize the new voxel_cond params.
+  if wan_config.get("enable_voxel_cond") and not restored_checkpoint:
+    params = _inject_voxel_cond_params(params, wan_config, rngs)
 
   params = jax.tree_util.tree_map_with_path(
       lambda path, x: cast_with_exclusion(path, x, dtype_to_cast=config.weights_dtype),
