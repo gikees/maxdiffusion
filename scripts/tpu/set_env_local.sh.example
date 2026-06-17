@@ -1,0 +1,12 @@
+# Local secrets for scripts/tpu/run.py — copy to set_env_local.sh (gitignored) and fill in.
+# Sourced by experiment scripts via `. scripts/tpu/set_env_local.sh`.
+
+# GitHub: the launcher clones the repo on the TPU. GIT_USER is your GitHub username;
+# GIT_KEY_PATH is the local private key authorized for the fork (forwarded via ssh-agent).
+export GIT_USER=gikees
+export GIT_KEY_PATH=~/.ssh/id_ed25519
+
+# Weights & Biases.
+export WANDB_API_KEY=<your-wandb-api-key>
+export WANDB_ENTITY=nyu-visionx
+export WANDB_PROJECT=persist

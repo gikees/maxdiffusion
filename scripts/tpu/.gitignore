@@ -1,0 +1,2 @@
+# Local secrets (WANDB_API_KEY, git creds) — never commit. Copy set_env_local.sh.example.
+set_env_local.sh
