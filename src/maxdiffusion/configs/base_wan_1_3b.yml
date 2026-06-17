@@ -15,6 +15,11 @@
 # This sentinel is a reminder to choose a real run name.
 run_name: ''
 
+# Weights & Biases logging (in addition to tensorboard). Needs WANDB_API_KEY in the env.
+use_wandb: False
+wandb_project: 'persist'
+wandb_entity: 'nyu-visionx'
+
 metrics_file: "" # for testing, local file that stores scalar metrics. If empty, no metrics are written.
 # If true save metrics such as loss and TFLOPS to GCS in {base_output_directory}/{run_name}/metrics/
 write_metrics: True

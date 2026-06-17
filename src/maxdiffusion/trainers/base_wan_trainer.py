@@ -285,6 +285,16 @@ class BaseWanTrainer(abc.ABC):
     writer_thread = threading.Thread(target=_tensorboard_writer_worker, args=(writer, self.config), daemon=True)
     writer_thread.start()
 
+    use_wandb = getattr(self.config, "use_wandb", False) and jax.process_index() == 0
+    if use_wandb:
+      import wandb
+
+      wandb.init(
+          project=getattr(self.config, "wandb_project", "persist"),
+          entity=getattr(self.config, "wandb_entity", None) or None,
+          name=self.config.run_name or None,
+      )
+
     num_model_parameters = max_utils.calculate_num_params_from_pytree(state.params)
     max_utils.add_text_to_summary_writer("number_model_parameters", str(num_model_parameters), writer)
     max_utils.add_text_to_summary_writer("libtpu_init_args", os.environ.get("LIBTPU_INIT_ARGS", ""), writer)
@@ -344,6 +354,8 @@ class BaseWanTrainer(abc.ABC):
         )
         if self.config.write_metrics:
           train_utils.write_metrics(writer, local_metrics_file, running_gcs_metrics, train_metric, step, self.config)
+        if use_wandb:
+          wandb.log({k: float(v) for k, v in train_metric["scalar"].items()}, step=int(step))
 
         if self.config.eval_every > 0 and (step + 1) % self.config.eval_every == 0:
           if self.config.enable_generate_video_for_eval:
@@ -365,6 +377,8 @@ class BaseWanTrainer(abc.ABC):
       writer_thread.join()
       if writer:
         writer.flush()
+      if use_wandb:
+        wandb.finish()
       if self.config.save_final_checkpoint:
         max_logging.log(f"Saving final checkpoint for step {step}")
         self.checkpointer.save_checkpoint(self.config.max_train_steps - 1, pipeline, state.params)
