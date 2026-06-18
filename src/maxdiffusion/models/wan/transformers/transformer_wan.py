@@ -656,6 +656,8 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       cond_out_dim: int = 16,
       cond_num_freqs: int = 8,
       cond_depth_scale: float = 1.0,
+      enable_action_cond: bool = False,
+      action_dim: int = 16,
   ):
     inner_dim = num_attention_heads * attention_head_dim
     out_channels = out_channels or in_channels
@@ -720,6 +722,23 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
         pos_embed_seq_len=pos_embed_seq_len,
         flash_min_seq_length=flash_min_seq_length,
     )
+
+    # Action conditioning: a zero-init linear projecting the player action into the time-embedding
+    # space, added per-frame to the timestep embedding (AdaLN-zero) so it is inert at init and the
+    # pretrained model is undisturbed.
+    self.enable_action_cond = enable_action_cond
+    self.action_proj = nnx.data(None)
+    if enable_action_cond:
+      self.action_proj = nnx.Linear(
+          action_dim,
+          inner_dim,
+          rngs=rngs,
+          dtype=dtype,
+          param_dtype=weights_dtype,
+          precision=precision,
+          kernel_init=nnx.initializers.zeros,
+          bias_init=nnx.initializers.zeros,
+      )
 
     # 3. Transformer blocks
     @nnx.split_rngs(splits=num_layers)
@@ -877,6 +896,7 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
       encoder_attention_mask: Optional[jax.Array] = None,
       proj_ids: Optional[jax.Array] = None,
       proj_depth: Optional[jax.Array] = None,
+      action: Optional[jax.Array] = None,
   ) -> Union[jax.Array, Tuple[jax.Array, jax.Array], Dict[str, jax.Array]]:
     hidden_states = nn.with_logical_constraint(hidden_states, ("batch", None, None, None, None))
     batch_size, _, num_frames, height, width = hidden_states.shape
@@ -931,6 +951,23 @@ class WanModel(nnx.Module, FlaxModelMixin, ConfigMixin):
             skip_embeddings=(kv_cache is not None),
         )
         timestep_proj = timestep_proj.reshape(timestep_proj.shape[0], 6, -1)
+
+    if self.enable_action_cond and action is not None:
+      # Per-frame action -> AdaLN-zero. Add the (zero-init) action projection to the timestep
+      # embedding per latent frame, re-project to the 6 AdaLN params, then broadcast each frame
+      # across its patch tokens (frame-major, matching the collapse of (T,H,W) above). This uses the
+      # per-token AdaLN path; with the zero-init projection it is identical to the global path at
+      # init, so the action is inert. Single global timestep for now (diffusion forcing deferred).
+      assert not per_token_t, "action conditioning + per-token timestep is not supported yet"
+      a = self.action_proj(action.astype(temb.dtype))  # (B, T_lat, dim)
+      assert a.shape[1] == post_patch_num_frames, "action frames must match latent frames"
+      temb = temb[:, None, :] + a  # (B, T_lat, dim)
+      timestep_proj = self.condition_embedder.time_proj(self.condition_embedder.act_fn(temb))
+      timestep_proj = timestep_proj.reshape(temb.shape[0], temb.shape[1], 6, -1)  # (B, T_lat, 6, dim)
+      reps = post_patch_height * post_patch_width
+      temb = jnp.repeat(temb, reps, axis=1)  # (B, seq_len, dim)
+      timestep_proj = jnp.repeat(timestep_proj, reps, axis=1)  # (B, seq_len, 6, dim)
+      per_token_t = True
 
     if encoder_attention_mask is None:
       encoder_attention_mask = encoder_attention_mask_out

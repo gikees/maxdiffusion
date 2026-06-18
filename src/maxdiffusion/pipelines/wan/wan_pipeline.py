@@ -166,6 +166,27 @@ def _inject_voxel_cond_params(params, wan_config, rngs):
   return params
 
 
+def _inject_action_cond_params(params, wan_config, rngs):
+  """Initialize the zero-init `action_proj` params (absent from a base checkpoint).
+
+  The action projection is zero-initialized so the action is inert at init and the pretrained model
+  is undisturbed. `inner_dim` is read from the (already loaded) patch-embedding kernel.
+  """
+  inner_dim = params["patch_embedding"]["kernel"].shape[-1]
+  proj = nnx.Linear(
+      wan_config["action_dim"],
+      inner_dim,
+      rngs=rngs,
+      dtype=wan_config["dtype"],
+      param_dtype=wan_config["weights_dtype"],
+      precision=wan_config["precision"],
+      kernel_init=nnx.initializers.zeros,
+      bias_init=nnx.initializers.zeros,
+  )
+  params["action_proj"] = nnx.state(proj, nnx.Param).to_pure_dict()
+  return params
+
+
 # For some reason, jitting this function increases the memory significantly, so instead manually move weights to device.
 def create_sharded_logical_transformer(
     devices_array: np.array,
@@ -223,6 +244,10 @@ def create_sharded_logical_transformer(
     wan_config["cond_num_freqs"] = config.cond_num_freqs
     wan_config["cond_depth_scale"] = config.cond_depth_scale
 
+  if getattr(config, "enable_action_cond", False):
+    wan_config["enable_action_cond"] = True
+    wan_config["action_dim"] = config.action_dim
+
   # 2. eval_shape - will not use flops or create weights on device
   # thus not using HBM memory.
   p_model_factory = partial(create_model, wan_config=wan_config)
@@ -255,10 +280,14 @@ def create_sharded_logical_transformer(
         subfolder=subfolder,
     )
 
-  # When loading a base (non-conditioned) checkpoint into a voxel-conditioned model, pad the
-  # patch-embedding (zeros for the new channels) and initialize the new voxel_cond params.
-  if wan_config.get("enable_voxel_cond") and not restored_checkpoint:
-    params = _inject_voxel_cond_params(params, wan_config, rngs)
+  # When loading a base (non-conditioned) checkpoint into a conditioned model, pad the
+  # patch-embedding (zeros for the new channels) + init voxel_cond, and/or init the zero-init
+  # action_proj — so the pretrained model is undisturbed at init.
+  if not restored_checkpoint:
+    if wan_config.get("enable_voxel_cond"):
+      params = _inject_voxel_cond_params(params, wan_config, rngs)
+    if wan_config.get("enable_action_cond"):
+      params = _inject_action_cond_params(params, wan_config, rngs)
 
   params = jax.tree_util.tree_map_with_path(
       lambda path, x: cast_with_exclusion(path, x, dtype_to_cast=config.weights_dtype),

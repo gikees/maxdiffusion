@@ -35,6 +35,8 @@ class WanTrainer(BaseWanTrainer):
   def get_data_shardings(self, mesh):
     data_sharding = jax.sharding.NamedSharding(mesh, P(*self.config.data_sharding))
     data_sharding = {"latents": data_sharding, "proj_ids": data_sharding, "proj_depth": data_sharding}
+    if getattr(self.config, "enable_action_cond", False):
+      data_sharding["actions"] = data_sharding["latents"]
     return data_sharding
 
   def get_eval_data_shardings(self, mesh):
@@ -43,6 +45,8 @@ class WanTrainer(BaseWanTrainer):
         "latents": data_sharding, "proj_ids": data_sharding, "proj_depth": data_sharding,
         "timesteps": data_sharding,
     }
+    if getattr(self.config, "enable_action_cond", False):
+      data_sharding["actions"] = data_sharding["latents"]
     return data_sharding
 
   def load_dataset(self, mesh, pipeline=None, is_training=True):
@@ -85,21 +89,27 @@ class WanTrainer(BaseWanTrainer):
       raise ValueError(
           "Wan 2.1 training only supports config.dataset_type set to tfrecords and config.cache_latents_text_encoder_outputs set to True"
       )
+    use_action = getattr(config, "enable_action_cond", False)
     feature_description = {
         "latents": tf.io.FixedLenFeature([], tf.string),
         "proj_ids": tf.io.FixedLenFeature([], tf.string),
         "proj_depth": tf.io.FixedLenFeature([], tf.string),
     }
+    if use_action:
+      feature_description["actions"] = tf.io.FixedLenFeature([], tf.string)
 
     if not is_training:
       feature_description["timesteps"] = tf.io.FixedLenFeature([], tf.int64)
 
     def _parse_cond(features):
-      return {
+      out = {
           "latents": tf.io.parse_tensor(features["latents"], out_type=tf.float32),
           "proj_ids": tf.io.parse_tensor(features["proj_ids"], out_type=tf.int32),
           "proj_depth": tf.io.parse_tensor(features["proj_depth"], out_type=tf.float16),
       }
+      if use_action:
+        out["actions"] = tf.io.parse_tensor(features["actions"], out_type=tf.float32)
+      return out
 
     def prepare_sample_train(features):
       return _parse_cond(features)
@@ -165,6 +175,7 @@ def step_optimizer(state, data, rng, scheduler_state, scheduler, config):
           encoder_hidden_states=encoder_hidden_states,
           proj_ids=data["proj_ids"],
           proj_depth=data["proj_depth"].astype(config.weights_dtype),
+          action=(data["actions"].astype(config.weights_dtype) if getattr(config, "enable_action_cond", False) else None),
           deterministic=False,
           rngs=nnx.Rngs(dropout=dropout_rng),
       )
@@ -208,10 +219,14 @@ def eval_step(state, data, rng, scheduler_state, scheduler, config):
 
   # The loss function logic is identical to training. We are evaluating the model's
   # ability to perform its core training objective (e.g., denoising).
-  def loss_fn(params, latents, encoder_hidden_states, timesteps, rng):
+  def loss_fn(params, latents, proj_ids, proj_depth, action, timesteps, rng):
     # Reconstruct the model from its definition and parameters
     model = nnx.merge(state.graphdef, params, state.rest_of_state)
 
+    bsz = latents.shape[0]
+    # Mirror the training objective: text is dropped (Phase 1), feed a zero embedding to the
+    # still-present cross-attention, and pass the projection (+ action) conditioning.
+    encoder_hidden_states = jnp.zeros((bsz, 1, 4096), dtype=config.weights_dtype)
     noise = jax.random.normal(key=rng, shape=latents.shape, dtype=latents.dtype)
     noisy_latents, training_target, training_weight = scheduler.apply_flow_match(noise, latents, timesteps)
     # Get the model's prediction
@@ -219,6 +234,9 @@ def eval_step(state, data, rng, scheduler_state, scheduler, config):
         hidden_states=noisy_latents,
         timestep=timesteps,
         encoder_hidden_states=encoder_hidden_states,
+        proj_ids=proj_ids,
+        proj_depth=proj_depth,
+        action=action,
         deterministic=True,
     )
 
@@ -237,6 +255,7 @@ def eval_step(state, data, rng, scheduler_state, scheduler, config):
   # Directly compute the loss without calculating gradients.
   # The model's state.params are used but not updated.
   # TODO(coolkp): Explore optimizing the creation of PRNGs in a vmap or statically outside of the loop
+  use_action = getattr(config, "enable_action_cond", False)
   bs = len(data["latents"])
   single_batch_size = config.global_batch_size_to_train_on
   losses = jnp.zeros(bs)
@@ -244,10 +263,12 @@ def eval_step(state, data, rng, scheduler_state, scheduler, config):
     start = i
     end = min(i + single_batch_size, bs)
     latents = data["latents"][start:end, :].astype(config.weights_dtype)
-    encoder_hidden_states = data["encoder_hidden_states"][start:end, :].astype(config.weights_dtype)
+    proj_ids = data["proj_ids"][start:end]
+    proj_depth = data["proj_depth"][start:end].astype(config.weights_dtype)
+    action = data["actions"][start:end].astype(config.weights_dtype) if use_action else None
     timesteps = data["timesteps"][start:end].astype("int64")
     _, new_rng = jax.random.split(rng, num=2)
-    loss = loss_fn(state.params, latents, encoder_hidden_states, timesteps, new_rng)
+    loss = loss_fn(state.params, latents, proj_ids, proj_depth, action, timesteps, new_rng)
     losses = losses.at[start:end].set(loss)
 
   # Structure the metrics for logging and aggregation

@@ -339,6 +339,9 @@ cond_depth_stride: 4
 cond_out_dim: 16
 cond_num_freqs: 8
 cond_depth_scale: 1.0
+# Action conditioning (player action -> zero-init AdaLN). Off by default.
+enable_action_cond: false
+action_dim: 16
 
 guidance_scale: 5.0
 flow_shift: 3.0
