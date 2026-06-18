@@ -331,7 +331,9 @@ num_frames: 81
 
 # Voxel-projection conditioning (PERSIST 2D side). Off by default; enable + override cond_* for runs.
 enable_voxel_cond: false
-cond_voxel_vocab: 25000
+# Embedding table for GT Minecraft block-state ids. Observed global max across the wander set is 26559
+# (1.21 block-states); kept generous so no id is out-of-vocab (an OOB embedding gather -> NaN loss).
+cond_voxel_vocab: 32000
 cond_feat_dim: 32
 cond_layers: 192
 cond_depth_patch: 6

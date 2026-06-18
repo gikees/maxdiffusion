@@ -567,6 +567,7 @@ class WanVoxelProjectionEmbedder(nnx.Module):
     self.max_period = max_period
     self.depth_scale = depth_scale
     self.use_depth_pos_enc = use_depth_pos_enc
+    self.vocab = vocab
     self.out_layers = (num_layers - depth_patch_size) // depth_stride + 1
     self.out_dim = out_dim
     self.dtype = dtype
@@ -600,6 +601,9 @@ class WanVoxelProjectionEmbedder(nnx.Module):
 
   def __call__(self, ids: jax.Array, depth: jax.Array) -> jax.Array:
     b, t, h, w, ell = ids.shape
+    # Guard against out-of-vocab ids: an OOB embedding gather yields NaN and poisons the whole run.
+    # Real ids should be in-range given cond_voxel_vocab; this is a safety net for future data.
+    ids = jnp.clip(ids, 0, self.vocab - 1)
     x = self.voxel_embed(ids)                                      # (B,T,H,W,L,feat)
     if self.use_depth_pos_enc:
       x = jnp.concatenate([x, self._depth_pos_enc(depth).astype(x.dtype)], axis=-1)
